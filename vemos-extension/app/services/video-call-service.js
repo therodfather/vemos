@@ -1,12 +1,14 @@
-import Service, { inject as service } from '@ember/service';
-import { tracked } from '@glimmer/tracking';
-import { A } from '@ember/array';
-import { isNone, isPresent } from '@ember/utils';
-import { later } from '@ember/runloop';
+import Service, { inject as service } from "@ember/service";
+import { tracked } from "@glimmer/tracking";
+import { A } from "@ember/array";
+import { isNone, isPresent } from "@ember/utils";
+import { later } from "@ember/runloop";
 import { RTCMessage } from "./peer-service";
 
 class VemosStream {
   videoCallService = undefined;
+  metricsService = undefined;
+
   @tracked isOwnStream;
   @tracked peerId;
   @tracked mediaStream;
@@ -17,65 +19,102 @@ class VemosStream {
   @tracked isHidden = false;
 
   constructor(inputs) {
-    let { peerId, mediaStream, displayableStream, audioStream, isOwnStream, videoCallService } = inputs;
+    let {
+      peerId,
+      mediaStream,
+      displayableStream,
+      audioStream,
+      isOwnStream,
+      videoCallService,
+      metricsService,
+    } = inputs;
     this.peerId = peerId;
     this.mediaStream = mediaStream;
     this.displayableStream = displayableStream ?? mediaStream;
     this.audioStream = audioStream ?? mediaStream;
     this.isOwnStream = isOwnStream ?? false;
     this.videoCallService = videoCallService;
+    this.metricsService = metricsService;
 
-    this.isMuted = !this.audioStream.getAudioTracks().some(track => track.enabled);
+    this.isMuted = !this.audioStream
+      .getAudioTracks()
+      .some((track) => track.enabled);
     this.setHiddenState();
 
     if (isNone(peerId)) {
-      throw new Error('Attempt to create a stream with no peer ID specified');
+      throw new Error("Attempt to create a stream with no peer ID specified");
     }
 
     if (isNone(mediaStream)) {
-      throw new Error('Attempt to create a stream with no mediaStream specified');
+      throw new Error(
+        "Attempt to create a stream with no mediaStream specified"
+      );
+    }
+  }
+
+  stop() {
+    console.log("Stop Stream");
+    try {
+      this.mediaStream.getTracks().forEach((track) => track.stop());
+      this.displayableStream.getTracks().forEach((track) => track.stop());
+      this.audioStream.getTracks().forEach((track) => track.stop());
+    } catch (error) {
+      console.error("Error cleaning up media streams", error);
     }
   }
 
   setHiddenState() {
     let tracks = this.displayableStream.getVideoTracks();
     if (isPresent(tracks)) {
-      this.isHidden = !this.displayableStream.getVideoTracks().some(track => track.enabled);
+      this.isHidden = !this.displayableStream
+        .getVideoTracks()
+        .some((track) => track.enabled);
     } else {
       this.isHidden = true;
     }
   }
 
   toggleAudio(providedState) {
-    let currentState = this.audioStream.getAudioTracks().some(track => track.enabled);
-    this.audioStream.getAudioTracks().forEach(track => {
+    let currentState = this.audioStream
+      .getAudioTracks()
+      .some((track) => track.enabled);
+    this.audioStream.getAudioTracks().forEach((track) => {
       track.enabled = providedState ?? !currentState;
     });
-    this.isMuted = !this.audioStream.getAudioTracks().some(track => track.enabled);
+    this.isMuted = !this.audioStream
+      .getAudioTracks()
+      .some((track) => track.enabled);
   }
 
   toggleVideo(providedState) {
     if (!this.isOwnStream) {
-      return console.error('Cannot disable another peers video stream');
+      return console.error("Cannot disable another peers video stream");
     }
-    let isEnabled = providedState ?? isPresent(this.displayableStream.getVideoTracks());
+    this.metricsService.recordMetric("toggle-video");
+    let isEnabled =
+      providedState ?? isPresent(this.displayableStream.getVideoTracks());
     if (isEnabled) {
+      this.videoCallService.endVideoStream();
       this.disableTracksForStream(this.displayableStream);
       this.disableTracksForStream(this.mediaStream);
       this.isHidden = true;
-      this.videoCallService.endVideoStream();
     } else {
       this.videoCallService.restartVideoStream();
     }
   }
 
   disableTracksForStream(stream) {
-    stream.getVideoTracks().forEach(track => {
+    console.log("disable tracks for stream");
+    stream.getVideoTracks().forEach((track) => {
       track.enabled = false;
-      later(this, () => {
-        stream.removeTrack(track);
-        track.stop();
-      }, 100);
+      later(
+        this,
+        () => {
+          stream.removeTrack(track);
+          track.stop();
+        },
+        100
+      );
     });
   }
 }
@@ -85,46 +124,118 @@ export { VemosStream };
 export default class VideoCallServiceService extends Service {
   @service peerService;
   @service parentDomService;
+  @service metricsService;
 
-  @tracked activeStreams =  A();
+  @tracked activeStreams = A();
 
   get ownMediaStream() {
-    return this.activeStreams.find(stream => stream.peerId === this.peerService.peerId);
+    return this.activeStreams.find(
+      (stream) => stream.peerId === this.peerService.peerId
+    );
   }
 
   get peerMediaStreams() {
-    return this.activeStreams.filter(stream => stream.peerId !== this.peerService.peerId);
+    return this.activeStreams.filter(
+      (stream) => stream.peerId !== this.peerService.peerId
+    );
+  }
+
+  initialize() {
+    this.peerService.addEventHandler(
+      "peer-call",
+      this.answerPeerCall.bind(this)
+    );
+    this.peerService.addEventHandler(
+      "on-stream",
+      this.connectPeerStream.bind(this)
+    );
+    this.peerService.addEventHandler(
+      "connection-opened",
+      this.callPeer.bind(this)
+    );
+    this.peerService.addEventHandler(
+      "connection-closed",
+      this.removePeerStream.bind(this)
+    );
+    this.peerService.addEventHandler(
+      "webcam-disabled",
+      this.disableVideoTracks.bind(this)
+    );
+
+    this.peerService.addEventHandler("self-reconnection", () => {
+      this.restartVideoStream();
+    });
+  }
+
+  answerPeerCall(call) {
+    call.answer(this.ownMediaStream.mediaStream);
+  }
+
+  connectPeerStream(call, mediaStream) {
+    if (call.peer === this.peerService.peerId) {
+      console.error("Refusing self connect for own stream");
+    }
+    console.log("connectPeerStream", mediaStream);
+    let stream = new VemosStream({
+      peerId: call.peer,
+      mediaStream,
+      metricsService: this.metricsService,
+    });
+    this.addStream(stream);
+  }
+
+  callPeer(connection) {
+    console.log("callPeer");
+    this.peerService.callPeer(connection.peer, this.ownMediaStream.mediaStream);
+  }
+
+  removePeerStream(connection) {
+    console.log("removePeerStream", connection);
+    this.removeStream(connection.peer);
+  }
+
+  disableVideoTracks(message) {
+    this.disableTracksForPeer(message.senderId);
   }
 
   addStream(stream) {
     if (isNone(stream)) {
-      throw new Error('No stream provided to addStream');
+      throw new Error("No stream provided to addStream");
     }
 
     let peerId = stream.peerId;
-    let existingStream = this.activeStreams.find(existingStream => existingStream.peerId === peerId);
+    let existingStream = this.activeStreams.find(
+      (existingStream) => existingStream.peerId === peerId
+    );
 
     if (existingStream) {
-      console.log(`Replacing existing stream for peer ${stream.peerId}`);
-      stream.toggleAudio(!existingStream.isMuted);
-      let index = this.activeStreams.indexOf(existingStream);
-      this.activeStreams.removeObject(existingStream);
-      this.activeStreams.insertAt(index, stream);
-    }  else {
+      if (existingStream.displayableStream.id !== stream.displayableStream.id) {
+        console.log(`Replacing existing stream for peer ${stream.peerId}`);
+        stream.toggleAudio(!existingStream.isMuted);
+        let index = this.activeStreams.indexOf(existingStream);
+        this.activeStreams.removeObject(existingStream);
+        this.activeStreams.insertAt(index, stream);
+        existingStream.stop();
+      }
+    } else {
       console.log(`Adding new stream for peer ${stream.peerId}`);
       this.activeStreams.pushObject(stream);
     }
-
   }
 
   removeStream(peerId) {
-    let existingStream = this.activeStreams.find(existingStream => existingStream.peerId === peerId);
+    let existingStream = this.activeStreams.find(
+      (existingStream) => existingStream.peerId === peerId
+    );
 
     if (existingStream) {
       console.log(`Removing stream for peer ${peerId}`);
       this.activeStreams.removeObject(existingStream);
+      existingStream.stop();
     } else {
-      console.error(`Attempted to remove stream for ${stream.peerId}, but no stream was found`);
+      console.error(
+        `Attempted to remove stream for ${peerId}, but no stream was found`
+      );
     }
   }
 
@@ -140,20 +251,22 @@ export default class VideoCallServiceService extends Service {
       audioStream: ownMediaStream,
       displayableStream: ownMediaStreamNoAudio,
       isOwnStream: true,
-      videoCallService: this
+      videoCallService: this,
+      metricsService: this.metricsService,
     });
+    this.removeStream(this.peerService.peerId);
     this.addStream(ownVemosStream);
   }
 
   async restartVideoStream() {
-    let stream = await this.getStream();
-    stream.getVideoTracks().forEach(track => {
-      this.ownMediaStream.mediaStream.addTrack(track);
-      this.ownMediaStream.displayableStream.addTrack(track);
-    });
+    console.log("Restart video stream");
+    await this.setupMediaStream();
     this.ownMediaStream.isHidden = false;
-    this.peerService.connections.forEach(connection => {
-      this.peerService.callPeer(connection.peer, this.ownMediaStream.mediaStream);
+    this.peerService.connections.forEach((connection) => {
+      this.peerService.callPeer(
+        connection.peer,
+        this.ownMediaStream.mediaStream
+      );
     });
   }
 
@@ -169,7 +282,22 @@ export default class VideoCallServiceService extends Service {
       .getUserMedia(settings)
       .catch((error) => {
         console.error(error);
-        console.error("Could not generate a MediaStream. Returning blank stream");
+        console.error("Could not generate a Video MediaStream.");
+        return this.getAudioOnlyStream();
+      });
+  }
+
+  async getAudioOnlyStream() {
+    let settings = {
+      audio: true,
+    };
+    return this.parentDomService.window.navigator.mediaDevices
+      .getUserMedia(settings)
+      .catch((error) => {
+        console.error(error);
+        console.error(
+          "Could not generate a Audio MediaStream. Returning blank stream"
+        );
         return new MediaStream();
       });
   }
@@ -177,16 +305,18 @@ export default class VideoCallServiceService extends Service {
   async endVideoStream() {
     let message = new RTCMessage({
       event: "webcam-disabled",
-      data: {}
+      data: {},
     });
     this.peerService.sendRTCMessage(message);
   }
 
   disableTracksForPeer(peerId) {
     console.log(`Disable video for ${peerId}`);
-    let stream = this.activeStreams.find(stream => stream.peerId === peerId);
+    let stream = this.activeStreams.find((stream) => stream.peerId === peerId);
     if (stream) {
-      stream.displayableStream.getVideoTracks().forEach(track => stream.displayableStream.removeTrack(track));
+      stream.displayableStream
+        .getVideoTracks()
+        .forEach((track) => stream.displayableStream.removeTrack(track));
       stream.setHiddenState();
     } else {
       console.log(`No stream found for ${peerId} to disable`);
